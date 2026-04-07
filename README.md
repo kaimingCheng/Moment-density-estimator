@@ -1,6 +1,6 @@
-# Hermite moment density estimator
+# Moment density estimator
 
-Density reconstruction from **empirical moments** using a **Hermite–Gaussian** (Gram) estimator, **bandwidth selection** via an asymptotic MISE proxy, and **convex post-processing** (OSQP) to enforce approximate nonnegativity of the estimated density on a grid. Optional **moment completion** extends a truncated moment sequence before re-running the same pipeline.
+Density reconstruction from **empirical moments** using a **generalize Hermite polynomial** estimator, **bandwidth selection** via an asymptotic MISE proxy, and **convex post-processing** (OSQP) to enforce approximate nonnegativity of the estimated density on a grid. Optional **moment completion** extends a truncated moment sequence.
 
 ## Pipeline (high level)
 
@@ -15,7 +15,7 @@ Density reconstruction from **empirical moments** using a **Hermite–Gaussian**
 | File | Role |
 |------|------|
 | `density_estimator_pipeline.py` | Core implementation: kernels, MISE, QP loop, `run_hermite_estimation_pipeline`, moment completion helpers. |
-| `density_estimator_postprocess.ipynb` | Short notebook: imports, standard-normal example, optional Johnson SU stub, moment-completion + rerun. |
+| `density_estimator_postprocess.ipynb` | Short notebook: imports, standard-normal example, optional Johnson SU stub, moment-completion. |
 
 ## Requirements
 
