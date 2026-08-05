@@ -64,7 +64,3 @@ python run_moment_density_estimator_complete.py --demo --output-dir results/demo
 
 The script writes a CSV table, JSON metadata, PNG figures, and a PDF report. If the true distribution is unknown, omit `--dist`; if it is known, add `--dist normal` or `--dist bimodal` to include the true PDF in the plots.
 The notebook’s first code cell tries **`cwd`** and **`cwd.parent`** automatically; if the error persists, add the directory that **actually contains** `density_estimator_pipeline.py` to `sys.path` manually.
-
-## License
-
-Add a `LICENSE` file in this repository if you want to specify terms (e.g. MIT).
