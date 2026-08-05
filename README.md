@@ -46,6 +46,10 @@ Open `moment_density_estimator_complete_demo.ipynb` in Jupyter, VS Code, or Cola
 
 Run the estimator from a moments file:
 
+```
+1,0,1,0,3,0,15,0
+```
+
 ```bash
 python run_moment_density_estimator_complete.py --moments moments.csv --prefix-len 8 --output-dir results --prefix my_report
 ```
