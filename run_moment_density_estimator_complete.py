@@ -22,7 +22,7 @@ import json
 from pathlib import Path
 
 import numpy as np
-from scipy.stats import norm
+import scipy.stats as st
 
 from moment_density_estimator_complete import (
     BimodalNormal,
@@ -30,6 +30,16 @@ from moment_density_estimator_complete import (
     hermite_complete_chain_report,
     save_report_outputs,
 )
+
+
+DEFAULT_A_GRIDS = {
+    "bimodal": (1.2, 2.9, 50),
+    "normal": (1.4, 2.0, 50),
+    "logistic": (1.9, 2.7, 50),
+    "skewed": (2.0, 3.2, 50),
+    "skewed_su": (2.0, 3.2, 50),
+    "su": (2.0, 3.2, 50),
+}
 
 
 def _load_vector(path):
@@ -49,7 +59,7 @@ def _make_dist(args):
     if args.dist is None:
         return None
     if args.dist == "normal":
-        return norm(loc=float(args.normal_loc), scale=float(args.normal_scale))
+        return st.norm(loc=float(args.normal_loc), scale=float(args.normal_scale))
     if args.dist == "bimodal":
         return BimodalNormal(
             mu1=float(args.mu1),
@@ -58,7 +68,23 @@ def _make_dist(args):
             sigma2=float(args.sigma2),
             w=float(args.mix_weight),
         )
+    if args.dist == "logistic":
+        return st.logistic(loc=0.0, scale=np.sqrt(3.0) / np.pi)
+    if args.dist in {"skewed", "skewed_su"}:
+        return st.johnsonsu(1.08, 2.18, loc=1.0, scale=1.76)
+    if args.dist == "su":
+        return st.johnsonsu(0.0, 1.8, loc=0.0, scale=1.6)
     raise ValueError(f"unknown --dist {args.dist!r}")
+
+
+def _make_a_grid(args, dist_key):
+    if args.a_min is None and args.a_max is None and args.a_points is None:
+        lo, hi, n = DEFAULT_A_GRIDS.get(dist_key, (0.9, 2.2, 32))
+    else:
+        lo = 0.9 if args.a_min is None else float(args.a_min)
+        hi = 2.2 if args.a_max is None else float(args.a_max)
+        n = 32 if args.a_points is None else int(args.a_points)
+    return np.linspace(float(lo), float(hi), int(n))
 
 
 def parse_args():
@@ -78,7 +104,12 @@ def parse_args():
     p.add_argument("--n-samples", type=int, default=50000, help="Sample size used for demo or MISE annotation.")
     p.add_argument("--seed", type=int, default=41, help="Random seed for demo sampling.")
 
-    p.add_argument("--dist", choices=["bimodal", "normal"], default=None, help="Optional reference PDF family for true-density plots.")
+    p.add_argument(
+        "--dist",
+        choices=["bimodal", "normal", "logistic", "skewed", "skewed_su", "su"],
+        default=None,
+        help="Optional built-in distribution for samples and true-density plots.",
+    )
     p.add_argument("--normal-loc", type=float, default=0.0)
     p.add_argument("--normal-scale", type=float, default=1.0)
     p.add_argument("--mu1", type=float, default=-2.0)
@@ -90,9 +121,9 @@ def parse_args():
     p.add_argument("--x-min", type=float, default=-8.0)
     p.add_argument("--x-max", type=float, default=8.0)
     p.add_argument("--x-points", type=int, default=129)
-    p.add_argument("--a-min", type=float, default=0.9)
-    p.add_argument("--a-max", type=float, default=2.2)
-    p.add_argument("--a-points", type=int, default=32)
+    p.add_argument("--a-min", type=float, default=None)
+    p.add_argument("--a-max", type=float, default=None)
+    p.add_argument("--a-points", type=int, default=None)
     p.add_argument("--fixed-a", type=float, default=None)
 
     p.add_argument("--extra-hermite-terms", type=int, default=3)
@@ -113,10 +144,12 @@ def main():
     args = parse_args()
     np.random.seed(int(args.seed))
     dist = _make_dist(args)
+    dist_key = args.dist
 
     if args.demo:
         if dist is None:
             dist = BimodalNormal()
+            dist_key = "bimodal"
         samples = dist.rvs(int(args.n_samples))
         moments_full = empirical_moments_from_samples(samples, int(args.max_moment_order))
         n_samples = int(args.n_samples)
@@ -130,6 +163,7 @@ def main():
     else:
         if dist is None:
             dist = BimodalNormal()
+            dist_key = "bimodal"
         samples = dist.rvs(int(args.n_samples))
         moments_full = empirical_moments_from_samples(samples, int(args.max_moment_order))
         n_samples = int(args.n_samples)
@@ -141,7 +175,7 @@ def main():
         raise ValueError("moments vector is shorter than --prefix-len")
 
     x = np.linspace(float(args.x_min), float(args.x_max), int(args.x_points))
-    a_grid = np.linspace(float(args.a_min), float(args.a_max), int(args.a_points))
+    a_grid = _make_a_grid(args, dist_key)
     result = hermite_complete_chain_report(
         moments_full[:prefix_len].copy(),
         dist,
