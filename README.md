@@ -44,20 +44,14 @@ Open `moment_density_estimator_complete_demo.ipynb` in Jupyter, VS Code, or Cola
 
 ### Command-line usage
 
-Run the estimator from a moments file:
+Run the estimator from example file with the following moments:
 
 ```
-1,0,1,0,3,0,15,0
+1,0,1,0,3,0,15,0,0,105
 ```
 
 ```bash
-python run_moment_density_estimator_complete.py --moments moments.csv --prefix-len 8 --output-dir results --prefix my_report
-```
-
-Run the estimator from a one-dimensional samples file:
-
-```bash
-python run_moment_density_estimator_complete.py --samples samples.csv --prefix-len 8 --max-moment-order 40 --output-dir results
+python run_moment_density_estimator_complete.py --moments example_moments.csv --prefix-len 9 --output-dir results --prefix my_report --dist normal
 ```
 
 Run a built-in demo:
