@@ -18,6 +18,7 @@ from matplotlib.figure import Figure
 import numpy as np
 import osqp
 import scipy.sparse as sp
+from scipy.optimize import brentq
 from scipy.stats import norm
 from numpy.polynomial.hermite import Hermite, herm2poly, hermval
 
@@ -131,6 +132,27 @@ class BimodalNormal:
         return self.w * norm.pdf(x, self.mu1, self.sigma1) + (1.0 - self.w) * norm.pdf(
             x, self.mu2, self.sigma2
         )
+
+    def cdf(self, x):
+        return self.w * norm.cdf(x, self.mu1, self.sigma1) + (1.0 - self.w) * norm.cdf(
+            x, self.mu2, self.sigma2
+        )
+
+    def ppf(self, q):
+        q_arr = np.asarray(q, dtype=float)
+        out = np.empty_like(q_arr, dtype=float)
+        lo = min(self.mu1 - 12.0 * self.sigma1, self.mu2 - 12.0 * self.sigma2)
+        hi = max(self.mu1 + 12.0 * self.sigma1, self.mu2 + 12.0 * self.sigma2)
+
+        for idx in np.ndindex(q_arr.shape):
+            p = float(q_arr[idx])
+            if p <= 0.0:
+                out[idx] = -np.inf
+            elif p >= 1.0:
+                out[idx] = np.inf
+            else:
+                out[idx] = brentq(lambda t: float(self.cdf(t)) - p, lo, hi)
+        return float(out) if out.shape == () else out
 
     def moment(self, n, *args, **kwargs):
         m1 = _univariate_normal_raw_moment(self.mu1, self.sigma1, n)
@@ -295,6 +317,67 @@ def _coefficient_to_moment_matrix(n_m, n_c, a):
     return A
 
 
+def _hermite_series_poly_coeffs(coeffs, a):
+    """Power-basis coefficients for sum_j coeffs[j] H_j(x/a), ascending order."""
+    coeffs = np.asarray(coeffs, dtype=float).ravel()
+    p = np.zeros(coeffs.size, dtype=float)
+    for j, cj in enumerate(coeffs):
+        if cj == 0.0:
+            continue
+        hj = _hermite_basis_j_coeffs_in_x(j, a)
+        p[: hj.size] += float(cj) * hj
+    return np.trim_zeros(p, trim="b") if np.any(p) else np.array([0.0])
+
+
+def _stationary_polynomial_coeffs(coeffs, a):
+    """Ascending coefficients of p'(x) - 2x p(x)/a^2 for f=u_a*p."""
+    p = _hermite_series_poly_coeffs(coeffs, a)
+    dp = np.polynomial.polynomial.polyder(p)
+    xp = np.concatenate([[0.0], p])
+    m = max(dp.size, xp.size)
+    stat = np.zeros(m, dtype=float)
+    stat[: dp.size] += dp
+    stat[: xp.size] -= (2.0 / (float(a) ** 2)) * xp
+    return np.trim_zeros(stat, trim="b") if np.any(stat) else np.array([0.0])
+
+
+def _real_roots_from_poly(poly_coeffs, *, imag_tol=1e-8):
+    coeffs = np.trim_zeros(np.asarray(poly_coeffs, dtype=float).ravel(), trim="b")
+    if coeffs.size <= 1:
+        return np.array([], dtype=float)
+    roots = np.polynomial.polynomial.polyroots(coeffs)
+    real_mask = np.abs(np.imag(roots)) <= imag_tol * (1.0 + np.abs(np.real(roots)))
+    real_roots = np.sort(np.real(roots[real_mask]))
+    if real_roots.size <= 1:
+        return real_roots.astype(float)
+    keep = [real_roots[0]]
+    for r in real_roots[1:]:
+        if abs(r - keep[-1]) > 1e-7 * (1.0 + abs(keep[-1])):
+            keep.append(r)
+    return np.asarray(keep, dtype=float)
+
+
+def _density_global_minimum_from_coeffs(coeffs, a, *, imag_tol=1e-8):
+    """Return (x_min, f_min, stationary_points) for the finite Hermite density."""
+    roots = _real_roots_from_poly(
+        _stationary_polynomial_coeffs(coeffs, a), imag_tol=imag_tol
+    )
+    if roots.size == 0:
+        return None, 0.0, roots
+    vals = plot_by_weights_final(roots, coeffs, a)
+    idx = int(np.argmin(vals))
+    return float(roots[idx]), float(vals[idx]), roots
+
+
+def _hermite_constraint_matrix(points, n_c, a):
+    """Rows H_j(y/a), equivalent to density constraints because u_a(y)>0."""
+    points = np.asarray(points, dtype=float).ravel()
+    H = np.zeros((points.size, int(n_c)), dtype=np.float64)
+    for j in range(int(n_c)):
+        H[:, j] = Hermite.basis(j)(points / float(a))
+    return H
+
+
 def moment_space_osqp_complete(
     mu_target,
     a,
@@ -313,6 +396,10 @@ def moment_space_osqp_complete(
     osqp_scaling=10,
     constrain_unit_mass=True,
     unit_mass_value=1.0,
+    nonnegative_strategy="grid",
+    positivity_tol=1e-8,
+    max_exchange_iter=30,
+    root_imag_tol=1e-8,
     extra_hermite_terms=0,
     moment_qp_complete_alpha=1.0,
     moment_qp_complete_lambda=1e-6,
@@ -326,6 +413,11 @@ def moment_space_osqp_complete(
 
     Extended regime: minimize
     ``alpha*(A c-mu)^T W (A c-mu) + lambda_eff*(c-c_ref)^T G (c-c_ref)``.
+
+    ``nonnegative_strategy="grid"`` enforces nonnegativity on the supplied
+    grid ``x``. ``"local_minima"`` uses an exchange method: add constraints at
+    violating stationary points, solve, globally re-check stationary points,
+    and repeat until the density minimum is above ``-positivity_tol``.
     """
     mu_target = np.asarray(mu_target, dtype=np.float64).ravel()
     x = np.asarray(x, dtype=np.float64).ravel()
@@ -336,8 +428,14 @@ def moment_space_osqp_complete(
         raise ValueError("x must be nonempty")
     if nonnegative_mode not in ("density", "hermite"):
         raise ValueError("nonnegative_mode must be 'density' or 'hermite'")
+    if nonnegative_strategy not in ("grid", "local_minima"):
+        raise ValueError("nonnegative_strategy must be 'grid' or 'local_minima'")
     if ridge_G < 0 or ridge_P < 0:
         raise ValueError("ridge_G and ridge_P must be nonnegative")
+    if positivity_tol < 0:
+        raise ValueError("positivity_tol must be nonnegative")
+    if max_exchange_iter < 1:
+        raise ValueError("max_exchange_iter must be positive")
 
     extra = int(extra_hermite_terms)
     if extra < 0:
@@ -383,27 +481,16 @@ def moment_space_osqp_complete(
 
     P = 0.5 * (P + P.T) + float(ridge_P) * np.eye(n_c, dtype=np.float64)
 
-    H = np.zeros((x.size, n_c), dtype=np.float64)
-    for j in range(n_c):
-        col = Hermite.basis(j)(x / float(a))
-        if nonnegative_mode == "density":
-            col = col * dirac(x, a)
-        H[:, j] = col
-    A_ineq = sp.csc_matrix(H)
-    l_ineq = np.zeros(x.size, dtype=np.float64)
-    u_ineq = np.full(x.size, np.inf, dtype=np.float64)
-
-    if bool(constrain_unit_mass):
-        A_mass = sp.csc_matrix(np.asarray(A[0, :], dtype=float).reshape(1, n_c))
-        A_con = sp.vstack([A_ineq, A_mass], format="csc")
-        l_con = np.concatenate([l_ineq, np.array([mass_target], dtype=np.float64)])
-        u_con = np.concatenate([u_ineq, np.array([mass_target], dtype=np.float64)])
-    else:
-        A_con = A_ineq
-        l_con = l_ineq
-        u_con = u_ineq
-
-    try:
+    def _solve_with_ineq(A_ineq, l_ineq, u_ineq):
+        if bool(constrain_unit_mass):
+            A_mass = sp.csc_matrix(np.asarray(A[0, :], dtype=float).reshape(1, n_c))
+            A_con = sp.vstack([A_ineq, A_mass], format="csc")
+            l_con = np.concatenate([l_ineq, np.array([mass_target], dtype=np.float64)])
+            u_con = np.concatenate([u_ineq, np.array([mass_target], dtype=np.float64)])
+        else:
+            A_con = A_ineq
+            l_con = l_ineq
+            u_con = u_ineq
         prob = osqp.OSQP()
         prob.setup(
             P=sp.csc_matrix(P),
@@ -418,7 +505,70 @@ def moment_space_osqp_complete(
             check_termination=int(osqp_check_termination),
             scaling=int(osqp_scaling),
         )
-        res = prob.solve()
+        return prob.solve()
+
+    exchange_points = np.array([], dtype=float)
+    exchange_iterations = 0
+    global_min_x = None
+    global_min_value = None
+    stationary_points = np.array([], dtype=float)
+    try:
+        if nonnegative_strategy == "grid":
+            H = np.zeros((x.size, n_c), dtype=np.float64)
+            for j in range(n_c):
+                col = Hermite.basis(j)(x / float(a))
+                if nonnegative_mode == "density":
+                    col = col * dirac(x, a)
+                H[:, j] = col
+            A_ineq = sp.csc_matrix(H)
+            l_ineq = np.zeros(x.size, dtype=np.float64)
+            u_ineq = np.full(x.size, np.inf, dtype=np.float64)
+            res = _solve_with_ineq(A_ineq, l_ineq, u_ineq)
+            c_tmp = np.asarray(res.x, dtype=np.float64).ravel()
+            global_min_x, global_min_value, stationary_points = (
+                _density_global_minimum_from_coeffs(
+                    c_tmp, a, imag_tol=float(root_imag_tol)
+                )
+            )
+        else:
+            y0, f0, roots0 = _density_global_minimum_from_coeffs(
+                c_ref, a, imag_tol=float(root_imag_tol)
+            )
+            stationary_points = roots0
+            if roots0.size:
+                vals0 = plot_by_weights_final(roots0, c_ref, a)
+                exchange_points = roots0[vals0 < -float(positivity_tol)]
+            elif y0 is not None and f0 < -float(positivity_tol):
+                exchange_points = np.array([y0], dtype=float)
+
+            res = None
+            for exchange_iterations in range(1, int(max_exchange_iter) + 1):
+                if exchange_points.size:
+                    H_ex = _hermite_constraint_matrix(exchange_points, n_c, a)
+                    A_ineq = sp.csc_matrix(H_ex)
+                    l_ineq = np.zeros(exchange_points.size, dtype=np.float64)
+                    u_ineq = np.full(exchange_points.size, np.inf, dtype=np.float64)
+                else:
+                    A_ineq = sp.csc_matrix((0, n_c), dtype=np.float64)
+                    l_ineq = np.zeros(0, dtype=np.float64)
+                    u_ineq = np.zeros(0, dtype=np.float64)
+
+                res = _solve_with_ineq(A_ineq, l_ineq, u_ineq)
+                c_tmp = np.asarray(res.x, dtype=np.float64).ravel()
+                global_min_x, global_min_value, stationary_points = (
+                    _density_global_minimum_from_coeffs(
+                        c_tmp, a, imag_tol=float(root_imag_tol)
+                    )
+                )
+                if global_min_value is None or global_min_value >= -float(positivity_tol):
+                    break
+                if global_min_x is None:
+                    break
+                if exchange_points.size and np.min(np.abs(exchange_points - global_min_x)) < 1e-7 * (
+                    1.0 + abs(global_min_x)
+                ):
+                    break
+                exchange_points = np.append(exchange_points, global_min_x)
     except Exception as exc:
         c0 = np.zeros(n_c, dtype=np.float64)
         return c0, False, {
@@ -441,11 +591,22 @@ def moment_space_osqp_complete(
             "n_moment_target": n_m,
             "n_hermite_coeffs": n_c,
             "extra_hermite_terms": extra,
+            "nonnegative_strategy": nonnegative_strategy,
+            "exchange_iterations": exchange_iterations,
+            "exchange_constraint_points": exchange_points,
+            "global_min_x": global_min_x,
+            "global_min_value": global_min_value,
         }
 
     c_opt = np.asarray(res.x, dtype=np.float64).ravel()
     status = getattr(res.info, "status", None) or getattr(res.info, "status_val", "unknown")
-    success = str(status) == "solved"
+    solver_success = str(status) == "solved"
+    positivity_success = (
+        nonnegative_strategy != "local_minima"
+        or global_min_value is None
+        or global_min_value >= -float(positivity_tol)
+    )
+    success = bool(solver_success and positivity_success)
     mu_tilde = A @ c_opt
     resid = mu_target - mu_tilde
     dc = c_opt - c_ref
@@ -455,6 +616,8 @@ def moment_space_osqp_complete(
         J = float(alpha * (resid @ W_complete @ resid) + lam_eff * (dc @ G_use @ dc))
     return c_opt, success, {
         "status": status,
+        "osqp_success": bool(solver_success),
+        "positivity_success": bool(positivity_success),
         "A": A,
         "density_l2_basis_gram": G_use,
         "coefficient_reference": c_ref,
@@ -475,6 +638,12 @@ def moment_space_osqp_complete(
         "n_moment_target": n_m,
         "n_hermite_coeffs": n_c,
         "extra_hermite_terms": extra,
+        "nonnegative_strategy": nonnegative_strategy,
+        "exchange_iterations": exchange_iterations,
+        "exchange_constraint_points": exchange_points,
+        "global_min_x": global_min_x,
+        "global_min_value": global_min_value,
+        "stationary_points": stationary_points,
         "osqp_info": res.info,
     }
 
@@ -505,6 +674,10 @@ def hermite_complete_chain_report(
     gram_n_grid=4001,
     gram_x_range_factor=12.0,
     nonnegative_mode="density",
+    nonnegative_strategy="grid",
+    positivity_tol=1e-8,
+    max_exchange_iter=30,
+    root_imag_tol=1e-8,
     verbose_moment_osqp=False,
     plot_metric_curves=True,
     plot_summary_figure=True,
@@ -581,6 +754,10 @@ def hermite_complete_chain_report(
             gram_n_grid=gram_n_grid,
             gram_x_range_factor=gram_x_range_factor,
             nonnegative_mode=nonnegative_mode,
+            nonnegative_strategy=nonnegative_strategy,
+            positivity_tol=positivity_tol,
+            max_exchange_iter=max_exchange_iter,
+            root_imag_tol=root_imag_tol,
             verbose=verbose_moment_osqp,
             constrain_unit_mass=constrain_unit_mass,
             unit_mass_value=unit_mass_value,
@@ -615,6 +792,9 @@ def hermite_complete_chain_report(
                 "global_min_raw": global_min_raw,
                 "global_min_complete": gmin_ms,
                 "complete_ok": bool(ok_ms),
+                "nonnegative_strategy": info_ms.get("nonnegative_strategy"),
+                "exchange_iterations": info_ms.get("exchange_iterations"),
+                "global_min_value": info_ms.get("global_min_value"),
                 "complete_objective_J": info_ms.get("objective_moment_J"),
                 "complete_distance": info_ms.get("gram_moment_distance"),
                 "implied_mu0_raw": float(mu_raw[0]),
@@ -681,7 +861,7 @@ def hermite_complete_chain_report(
         ax2.set_xlabel("extra Hermite terms")
         ax2.set_ylabel("log 10 scale")
         ax2.set_yscale("log", base=10)
-        ax2.set_title("(A c - mu*)^T W (A c - mu*) / complete distance")
+        ax2.set_title("Target distance")
         ax2.grid(True, alpha=0.3, which="both")
         _tight_layout_quiet(figure_metrics)
 
@@ -729,7 +909,7 @@ def hermite_complete_chain_report(
         ax1.set_yscale("log", base=10)
         ax1.set_xlabel("extra Hermite terms")
         ax1.set_ylabel("log 10 scale")
-        ax1.set_title("(A c - mu*)^T W (A c - mu*), Target distance")
+        ax1.set_title("Target distance")
         ax1.grid(True, alpha=0.3, which="both")
         if has_true_density:
             ax2.plot(x, y_true, "k-", lw=2, label="true PDF")
@@ -753,6 +933,9 @@ def hermite_complete_chain_report(
         "mise_curve_values": None if mise_curve is None else np.asarray(mise_curve).copy(),
         "mise_minimum_value": mise_min,
         "optimal_a": a_star,
+        "x_grid": np.asarray(x).copy(),
+        "density_raw": np.asarray(y_raw).copy(),
+        "density_complete": np.asarray(y_ms_final).copy(),
         "target_moments": mu0.copy(),
         "implied_moments_raw": np.asarray(mu_raw).copy(),
         "implied_moments_complete": np.asarray(mu_ms).copy(),
