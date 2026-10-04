@@ -134,6 +134,9 @@ def parse_args():
     p.add_argument("--ridge-p", type=float, default=0.0)
     p.add_argument("--gram-n-grid", type=int, default=1001)
     p.add_argument("--gram-x-range-factor", type=float, default=12.0)
+    p.add_argument("--nonnegative-strategy", choices=["grid", "local_minima"], default="grid")
+    p.add_argument("--positivity-tol", type=float, default=1e-8)
+    p.add_argument("--max-exchange-iter", type=int, default=30)
     p.add_argument("--no-unit-mass", action="store_true", help="Disable unit-mass equality.")
     p.add_argument("--unit-mass-value", type=float, default=1.0)
     p.add_argument("--verbose-osqp", action="store_true")
@@ -187,6 +190,9 @@ def main():
         moment_space_ridge_P=float(args.ridge_p),
         gram_n_grid=int(args.gram_n_grid),
         gram_x_range_factor=float(args.gram_x_range_factor),
+        nonnegative_strategy=args.nonnegative_strategy,
+        positivity_tol=float(args.positivity_tol),
+        max_exchange_iter=int(args.max_exchange_iter),
         verbose_moment_osqp=bool(args.verbose_osqp),
         constrain_unit_mass=not bool(args.no_unit_mass),
         unit_mass_value=float(args.unit_mass_value),
